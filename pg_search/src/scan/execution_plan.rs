@@ -384,14 +384,34 @@ impl PgSearchScanPlan {
     }
 
     /// Configures this scan to execute iterative, expanding-window Top-K pulls via
-    /// `SearchIndexReader::search_top_k_in_segments` instead of streaming segment-by-segment.
+    /// `SearchIndexReader::search_top_k_in_segments` (or range-filtered variants when
+    /// range-partitioned) instead of streaming segment-by-segment.
     pub fn with_lazy_sort(mut self, lazy_sort: LazySortConfig) -> Self {
         let schema = self.properties.eq_properties.schema().clone();
-        let eq_properties =
-            build_equivalence_properties(schema, self.sort_order.as_ref(), Some(&lazy_sort));
-        // NOTE: Lazy-sorted scans currently execute as a single `Shared` partition;
-        // `LazySegmentTarget::RangePartitioned` is wired up in `lazy_sort` for future
-        // range-partitioned rank joins.
+        if self.range_split_points.is_none() {
+            self.global_partition_count = 1;
+            self.assigned_partition = None;
+            self.partition_segments = None;
+            if lazy_sort.shared_threshold == SharedThresholdMode::Disabled {
+                let mut state_guard = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let ExecutionState::Shared { parallel_state, .. } = &mut *state_guard {
+                    *parallel_state = None;
+                }
+            }
+        }
+        self.lazy_sort = Some(lazy_sort);
+        self.rebuild_properties_with_schema(schema);
+        self
+    }
+
+    /// Collapses a range-partitioned or multi-partition scan to a single `Shared` partition
+    /// (`UnknownPartitioning(1)`). Used when a rank join cannot be co-partitioned in a single
+    /// stage and therefore falls back to `PartitionMode::CollectLeft`
+    /// (TODO: <https://github.com/paradedb/paradedb/issues/5559>).
+    pub(crate) fn into_single_shared_partition(mut self) -> Self {
         self.global_partition_count = 1;
         self.range_split_points = None;
         self.assigned_partition = None;
@@ -407,30 +427,12 @@ impl PgSearchScanPlan {
                         parallel_state: None,
                         scan_state,
                     },
-                    ExecutionState::Shared {
-                        parallel_state,
-                        scan_state,
-                    } => ExecutionState::Shared {
-                        parallel_state: if lazy_sort.shared_threshold
-                            == SharedThresholdMode::Disabled
-                        {
-                            None
-                        } else {
-                            parallel_state
-                        },
-                        scan_state,
-                    },
                     other => other,
                 };
             *state_guard = new_state;
         }
-        self.properties = Arc::new(PlanProperties::new(
-            eq_properties,
-            Partitioning::UnknownPartitioning(1),
-            EmissionType::Incremental,
-            Boundedness::Bounded,
-        ));
-        self.lazy_sort = Some(lazy_sort);
+        let schema = self.properties.eq_properties.schema().clone();
+        self.rebuild_properties_with_schema(schema);
         self
     }
 
@@ -789,9 +791,18 @@ impl PgSearchScanPlan {
     }
 
     fn rebuild_properties_with_schema(&mut self, schema: SchemaRef) {
+        let partitioning = if self.assigned_partition.is_some() {
+            Partitioning::UnknownPartitioning(1)
+        } else {
+            declared_partitioning(
+                &schema,
+                self.global_partition_count,
+                self.range_split_points.as_ref(),
+            )
+        };
         self.properties = Arc::new(PlanProperties::new(
             build_equivalence_properties(schema, self.sort_order.as_ref(), self.lazy_sort.as_ref()),
-            self.properties.output_partitioning().clone(),
+            partitioning,
             EmissionType::Incremental,
             Boundedness::Bounded,
         ));
@@ -2172,21 +2183,17 @@ impl<T: Stream<Item = Result<RecordBatch>>> RecordBatchStream for UnsafeSendStre
     }
 }
 
-/// Caps a `PgSearchScanPlan`'s stage at its `partition_count` tasks (or `1` task for
-/// `RankJoinExec` and lazy-sorted scans so all components of a rank join execute in a
-/// single `datafusion-distributed` task where in-memory dynamic filters work).
-///
-/// This preserves useful scan parallelism: a single-segment or lazy-sorted scan has one task,
-/// while larger or range-partitioned scans expose their partitions to the distributed planner.
+/// Caps a `PgSearchScanPlan` or `RankJoinExec` stage at its `output_partitioning().partition_count()`
+/// tasks: `1` task for single-partition (`CollectLeft` / `Shared` lazy-sort) plans so all
+/// components of a non-co-partitioned rank join execute in a single task, and `N` tasks for
+/// range-partitioned (`Partitioned` / `RangePartitioned`) plans.
 pub(crate) fn pg_search_scan_desired_task_count(
     ev: DesiredTaskCountEvent,
 ) -> Option<datafusion::error::Result<DesiredTaskCountEventResponse>> {
-    if ev.plan.is::<crate::scan::rank_join_exec::RankJoinExec>() {
-        return Some(Ok(DesiredTaskCountEventResponse::maximum(1)));
-    }
-    let scan = ev.plan.downcast_ref::<PgSearchScanPlan>()?;
-    if scan.lazy_sort().is_some() {
-        return Some(Ok(DesiredTaskCountEventResponse::maximum(1)));
+    if !ev.plan.is::<crate::scan::rank_join_exec::RankJoinExec>()
+        && !ev.plan.is::<PgSearchScanPlan>()
+    {
+        return None;
     }
     let partition_count = ev.plan.properties().output_partitioning().partition_count();
     // `maximum` rather than `desired`: `partition_count` is already clamped to the number
