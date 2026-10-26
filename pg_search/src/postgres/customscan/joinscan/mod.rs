@@ -1158,6 +1158,12 @@ impl JoinScan {
     /// EndCustomScan and before a correlated rescan relaunches a fresh worker set.
     fn finish_mpp_execution(state: &mut CustomScanStateWrapper<Self>) {
         state.custom_state_mut().datafusion_stream = None;
+        {
+            let cs = state.custom_state_mut();
+            if let Some(leader) = cs.mpp.leader_mut() {
+                leader.finish_leader_fragments(cs.runtime.as_ref());
+            }
+        }
         if let Some(leader) = state.custom_state().mpp.leader()
             && let Some(plan) = state.custom_state().physical_plan.as_ref()
         {
@@ -1708,6 +1714,7 @@ impl CustomScan for JoinScan {
                 Self::maybe_solve_and_rebake(state);
 
                 let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
                     .build()
                     .unwrap();
                 let mut join_clause = state.custom_state().join_clause.clone();
@@ -1818,7 +1825,11 @@ impl CustomScan for JoinScan {
                 // replan serially.
                 let (ctx, plan) = if mpp_pending {
                     match Self::launch_mpp(state, &plan) {
-                        Some(leader) => {
+                        Some(mut leader) => {
+                            leader.spawn_leader_fragments(
+                                create_datafusion_session_context(),
+                                &runtime,
+                            );
                             let source = crate::postgres::customscan::mpp::glue::StagePlanDispatchSource::default();
                             let exec_ctx = Self::build_mpp_session_context(Some(Arc::clone(
                                 &leader.session.mesh,
@@ -2027,6 +2038,12 @@ impl CustomScan for JoinScan {
         // leader-inbox detach, so producers blocked on full rings stop. Harmless when the gather
         // already reached EOF.
         state.custom_state_mut().datafusion_stream = None;
+        {
+            let cs = state.custom_state_mut();
+            if let Some(leader) = cs.mpp.leader_mut() {
+                leader.finish_leader_fragments(cs.runtime.as_ref());
+            }
+        }
 
         // Drain the workers' metrics frames off the mesh BEFORE joining the workers. On an
         // early-terminated query the rings still hold data the leader will never read; a worker's
