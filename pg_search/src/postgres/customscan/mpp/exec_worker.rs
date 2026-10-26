@@ -108,12 +108,17 @@ pub(crate) fn build_mpp_session_context(
     // fewer than 2 producer tasks (#5784), matching execution. mesh = Some reads the
     // launched width from the mesh header, which the plan-first launch sized from the
     // plan's task counts (#5667).
-    let n_workers = match mesh.as_ref() {
-        Some(m) => m.n_workers() as usize,
-        None => producer_worker_cap() as usize,
+    let local_partitions = crate::gucs::mpp_local_partitions();
+    let n_workers = if local_partitions > 0 {
+        local_partitions
+    } else {
+        match mesh.as_ref() {
+            Some(m) => m.n_workers() as usize,
+            None => producer_worker_cap() as usize,
+        }
     };
     assert!(
-        n_workers >= 2,
+        n_workers >= 2 || local_partitions > 0,
         "MPP session contexts require at least two producer workers"
     );
     // Three knobs that have to be set for the planner to actually emit `NetworkShuffleExec`:

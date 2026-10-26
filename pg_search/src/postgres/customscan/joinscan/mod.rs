@@ -1172,11 +1172,9 @@ impl JoinScan {
                 &leader.session.mesh,
             );
         }
-        let finish = match state.custom_state_mut().mpp.take_leader() {
-            Some(mut leader) => leader.finish.take(),
-            None => None,
-        };
-        if finish.is_some() {
+        let mut leader = state.custom_state_mut().mpp.take_leader();
+        let finish = leader.as_mut().and_then(|l| l.finish.take());
+        if leader.is_some() {
             let cs = state.custom_state_mut();
             cs.current_batch = None;
             cs.physical_plan = None;
@@ -1187,8 +1185,12 @@ impl JoinScan {
             // is what orders its store before this load. `recv` is idempotent, so the
             // one inside `wait_for_finish` returns at once.
             let _ = finish.recv();
-            record_worker_spill(&state.custom_state().spilled, &finish);
+            if let Some(ref leader) = leader {
+                record_worker_spill(&state.custom_state().spilled, leader);
+            }
             finish.wait_for_finish();
+        } else if let Some(ref leader) = leader {
+            record_worker_spill(&state.custom_state().spilled, leader);
         }
     }
 }
@@ -2070,10 +2072,7 @@ impl CustomScan for JoinScan {
         }
         // Must come after the join; see `warn_if_spilled`.
         let cs = state.custom_state();
-        warn_if_spilled(
-            &cs.spilled,
-            cs.mpp.leader().and_then(|leader| leader.finish.as_ref()),
-        );
+        warn_if_spilled(&cs.spilled, cs.mpp.leader());
     }
 
     fn end_custom_scan(state: &mut CustomScanStateWrapper<Self>) {
