@@ -2088,6 +2088,7 @@ dependencies = [
 [[package]]
 name = "datafusion-distributed"
 version = "4.0.0"
+source = "git+https://github.com/paradedb/datafusion-distributed.git?branch=stuhood.force-mpp#db9db67e800998a2efc2ea62205b5bac36f7b714"
 dependencies = [
  "async-stream",
  "async-trait",

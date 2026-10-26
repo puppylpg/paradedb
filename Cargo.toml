@@ -86,8 +86,5 @@ tantivy-jieba = "0.20.0"
 tantivy-common = { git = "https://github.com/paradedb/tantivy.git", package = "tantivy-common", rev = "101d03ad260b5cbb67829b6ef41d9f6359cad6e5" }
 tantivy-tokenizer-api = { git = "https://github.com/paradedb/tantivy.git", package = "tantivy-tokenizer-api", rev = "101d03ad260b5cbb67829b6ef41d9f6359cad6e5" }
 
-[patch."https://github.com/paradedb/datafusion-distributed.git"]
-datafusion-distributed = { path = "/Users/stuhood/src/df-d-0" }
-
 [workspace.lints.clippy]
 large_futures = "warn"

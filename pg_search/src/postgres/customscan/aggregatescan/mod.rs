@@ -1245,13 +1245,7 @@ impl CustomScan for AggregateScan {
                 let _ = finish.recv();
             }
             // Must come after the join; see `warn_if_spilled`.
-            warn_if_spilled(
-                &df_state.spilled,
-                df_state
-                    .mpp
-                    .leader()
-                    .and_then(|leader| leader.finish.as_ref()),
-            );
+            warn_if_spilled(&df_state.spilled, df_state.mpp.leader());
         }
     }
 
@@ -1364,10 +1358,8 @@ impl AggregateScan {
                 &leader.session.mesh,
             );
         }
-        let finish = match df_state.mpp.take_leader() {
-            Some(mut leader) => leader.finish.take(),
-            None => None,
-        };
+        let mut leader = df_state.mpp.take_leader();
+        let finish = leader.as_mut().and_then(|l| l.finish.take());
         // Drop order: the physical plan and session hold a mesh reference, so both
         // must go before the DSM is destroyed below, and the stream must go before
         // the runtime (tokio). `physical_plan` is cleared explicitly rather than left
@@ -1380,8 +1372,15 @@ impl AggregateScan {
             // is what orders its store before this load. `recv` is idempotent, so the
             // one inside `wait_for_finish` returns at once.
             let _ = finish.recv();
-            crate::postgres::customscan::mpp::glue::record_worker_spill(&df_state.spilled, &finish);
+            if let Some(ref leader) = leader {
+                crate::postgres::customscan::mpp::glue::record_worker_spill(
+                    &df_state.spilled,
+                    leader,
+                );
+            }
             finish.wait_for_finish();
+        } else if let Some(ref leader) = leader {
+            crate::postgres::customscan::mpp::glue::record_worker_spill(&df_state.spilled, leader);
         }
     }
 

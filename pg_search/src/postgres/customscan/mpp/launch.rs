@@ -306,6 +306,9 @@ impl MppLifecycle {
 /// sources, so `Unknown` marks a placeholder; silently serializing a big query would cost far
 /// more than a wasted launch.
 pub(crate) fn mpp_gated_by_min_rows<'a>(sources: impl IntoIterator<Item = &'a ScanInfo>) -> bool {
+    if crate::gucs::mpp_local_partitions() > 0 {
+        return false;
+    }
     gated_by_min_rows(
         crate::gucs::mpp_min_rows() as u64,
         sources
@@ -318,7 +321,7 @@ pub(crate) fn mpp_gated_by_min_rows<'a>(sources: impl IntoIterator<Item = &'a Sc
 /// (#6157), PG's worker budget admits producers, and the query clears the size gate (#5784).
 /// Shared by launch preparation and the plain-EXPLAIN plan rebuild so both agree.
 pub(crate) fn mpp_eligible(parallel_mode_ok: bool, plan: &RelNode) -> bool {
-    parallel_mode_ok
+    (parallel_mode_ok || crate::gucs::mpp_local_partitions() > 0)
         && mpp_is_active()
         && !mpp_gated_by_min_rows(plan.sources().into_iter().map(|s| &s.scan_info))
 }
@@ -373,19 +376,67 @@ fn launch_mpp(
         // least one fragment of the widest stage.
         return None;
     }
-    let max_tasks = max_producer_task_count(&stages);
-    let cap = producer_worker_cap();
-    let producer_count = (max_tasks as u32).clamp(MIN_TOTAL_WORKER_COUNT, cap);
-    let requested_bg_workers = producer_count - 1;
-
-    // The finished physical stages determine the stage sizing list, so build the real payload
-    // before sizing DSM. A failure is a codec bug, and no workers have been started at this point.
     let t_payload = std::time::Instant::now();
     let payload = match dispatch_payload_from_stages(&stages) {
         Ok(p) => p,
         Err(e) => pgrx::error!("mpp: dispatch payload build failed: {e}"),
     };
     timing.payload_us = t_payload.elapsed().as_micros() as u64;
+
+    if crate::gucs::mpp_local_partitions() > 0 {
+        let t_prepare = std::time::Instant::now();
+        let region_bytes = match estimate_dsm_size(1, payload.len()) {
+            Ok(sz) => sz,
+            Err(e) => {
+                pgrx::warning!("mpp: estimate_dsm failed: {e}; running serially");
+                return None;
+            }
+        };
+        let scan_size = ParallelScanState::size_of(&args.all_nsegments(), false, false);
+        let (mesh_ptr, mesh_layout) =
+            crate::postgres::customscan::mpp::glue::alloc_local_dsm_region(region_bytes);
+        let (scan_raw, scan_layout) =
+            crate::postgres::customscan::mpp::glue::alloc_local_dsm_region(scan_size.max(8));
+        let scan_ptr = scan_raw as *mut ParallelScanState;
+        unsafe { (*scan_ptr).create_and_populate(args) };
+        let plan_sources_count = unsafe { (*scan_ptr).source_count() };
+        timing.prepare_us = t_prepare.elapsed().as_micros() as u64;
+        timing.workers = 1;
+
+        crate::mpp_log!("launch: spawning 1 producer (local partitions)");
+        crate::scan::execution_plan::stamp_parallel_state(physical, scan_ptr);
+
+        let t_setup = std::time::Instant::now();
+        let mut leader = match unsafe { leader_setup(mesh_ptr as *mut c_void, 1, payload) } {
+            Ok(l) => l,
+            Err(e) => {
+                unsafe {
+                    std::alloc::dealloc(mesh_ptr, mesh_layout);
+                    std::alloc::dealloc(scan_raw, scan_layout);
+                }
+                pgrx::error!("mpp: leader_setup failed: {e}");
+            }
+        };
+        timing.leader_setup_us = t_setup.elapsed().as_micros() as u64;
+        leader.timing = timing;
+        leader.parallel_state = scan_ptr;
+        leader.plan_sources_count = plan_sources_count;
+        leader.local_dsm = Some(unsafe {
+            crate::postgres::customscan::mpp::glue::LocalMppDsm::new(
+                mesh_ptr,
+                mesh_layout,
+                scan_raw,
+                scan_layout,
+                std::sync::Arc::clone(&leader.session.mesh),
+            )
+        });
+        return Some(leader);
+    }
+
+    let max_tasks = max_producer_task_count(&stages);
+    let cap = producer_worker_cap();
+    let producer_count = (max_tasks as u32).clamp(MIN_TOTAL_WORKER_COUNT, cap);
+    let requested_bg_workers = producer_count - 1;
 
     let t_prepare = std::time::Instant::now();
     let region_bytes = match estimate_dsm_size(producer_count, payload.len()) {
