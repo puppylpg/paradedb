@@ -1219,6 +1219,9 @@ impl CustomScan for AggregateScan {
         // query so blocked producers stop).
         if let Some(df_state) = state.custom_state_mut().datafusion_state.as_mut() {
             df_state.stream = None;
+            if let Some(leader) = df_state.mpp.leader_mut() {
+                leader.finish_leader_fragments(df_state.runtime.as_ref());
+            }
             // Drain the workers' metrics frames off the mesh BEFORE joining the workers. On an
             // early-terminated query the rings still hold data the leader will never read; a
             // worker's bounded metrics send spins on the full ring until the leader frees slots.
@@ -1350,6 +1353,9 @@ impl AggregateScan {
     /// `end_custom_scan` and before a rescan relaunches a fresh worker set.
     fn finish_mpp_execution(df_state: &mut scan_state::DataFusionAggState) {
         df_state.stream = None;
+        if let Some(leader) = df_state.mpp.leader_mut() {
+            leader.finish_leader_fragments(df_state.runtime.as_ref());
+        }
         if let Some(leader) = df_state.mpp.leader()
             && let Some(plan) = df_state.physical_plan.as_ref()
         {
@@ -2272,6 +2278,8 @@ impl AggregateScan {
             let is_mpp = mpp_pending;
             let plan_ctx = if is_mpp {
                 Self::build_mpp_session_context(None)
+                    .with_distributed_metrics_collection(state.is_instrumented())
+                    .expect("with_distributed_metrics_collection")
             } else {
                 create_aggregate_session_context()
             };
@@ -2327,7 +2335,8 @@ impl AggregateScan {
                 .expect("DataFusion state must be initialized");
             let (ctx, physical_plan) = if is_mpp {
                 match leader {
-                    Some(leader) => {
+                    Some(mut leader) => {
+                        leader.spawn_leader_fragments(create_aggregate_session_context(), &runtime);
                         let source =
                             crate::postgres::customscan::mpp::glue::StagePlanDispatchSource::default();
                         let exec_ctx =

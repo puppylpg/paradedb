@@ -44,21 +44,22 @@ use crate::gucs::mpp_queue_size as gucs_mpp_queue_size;
 use crate::parallel_worker::builder::ParallelProcessFinish;
 use crate::postgres::customscan::mpp::pg_seams::{PgInterrupt, PgWakeup, pack_receiver};
 
-/// Minimum total procs for MPP: leader (consumer-only, proc 0) plus at least 2 producers.
-/// Below that, `build_mpp_session_context` still clamps `target_partitions` to 2 and the mesh
-/// wouldn't have a queue for the second partition. Single source of truth so [`mpp_is_active`]
-/// and the launch's clamp floor don't drift on the threshold.
-pub const MIN_TOTAL_WORKER_COUNT: u32 = 3;
+/// Minimum total participating procs for MPP: leader (proc 0, consumer + producer) plus at
+/// least 1 background worker (= 2 total producers). Below that, `build_mpp_session_context`
+/// still clamps `target_partitions` to 2 and there would be no data parallelism. Single
+/// source of truth so [`mpp_is_active`] and the launch's clamp floor don't drift on the
+/// threshold.
+pub const MIN_TOTAL_WORKER_COUNT: u32 = 2;
 
-/// True iff PostgreSQL's parallelism budget allows at least `MIN_TOTAL_WORKER_COUNT - 1`
-/// producer workers. There is no MPP-specific worker GUC (#5667):
-/// `max_parallel_workers_per_gather` caps the per-query width — the same knob that caps
-/// ordinary parallel scans, matching core PG's `compute_parallel_worker` convention — and
-/// `max_parallel_workers` is the cluster-wide pool. Setting
+/// True iff PostgreSQL's parallelism budget allows at least `MIN_TOTAL_WORKER_COUNT`
+/// participating producers (leader + background workers). There is no MPP-specific worker
+/// GUC (#5667): `max_parallel_workers_per_gather` caps the per-query width — the same knob
+/// that caps ordinary parallel scans, matching core PG's `compute_parallel_worker`
+/// convention — and `max_parallel_workers` is the cluster-wide pool. Setting
 /// `max_parallel_workers_per_gather` below 2 (or 0, PG's own parallelism-disable convention)
 /// disables MPP. Customscan path-builders gate `parallel_workers` on this.
 pub fn mpp_is_active() -> bool {
-    producer_worker_cap() >= MIN_TOTAL_WORKER_COUNT - 1
+    producer_worker_cap() >= MIN_TOTAL_WORKER_COUNT
 }
 
 /// Whether PostgreSQL judged the entire statement safe to execute while parallel mode is active.
@@ -159,6 +160,15 @@ pub struct MppLeaderState {
     pub finish: Option<crate::parallel_worker::builder::ParallelProcessFinish>,
     /// Per-phase launch timing the leader fills in as it commits, for `EXPLAIN ANALYZE`.
     pub timing: MppLaunchTiming,
+    /// Shared `ParallelScanState` pointer in DSM, used by the leader's own producer fragments.
+    pub parallel_state: *mut crate::postgres::ParallelScanState,
+    /// Number of scan sources in `parallel_state`.
+    pub plan_sources_count: usize,
+    /// Cancellation token for the leader's producer fragment task.
+    pub leader_token: tokio_util::sync::CancellationToken,
+    /// Handle to the leader's producer fragment task (`proc 0`) spawned on the scan's runtime.
+    pub leader_task:
+        Option<tokio::task::JoinHandle<Result<(), datafusion::common::DataFusionError>>>,
 }
 
 /// The `(pgprocno, pid)` of this backend, packed into the receiver token the transport stores so a
@@ -222,6 +232,10 @@ pub unsafe fn leader_setup(
         session,
         finish: None,
         timing: MppLaunchTiming::default(),
+        parallel_state: std::ptr::null_mut(),
+        plan_sources_count: 0,
+        leader_token: tokio_util::sync::CancellationToken::new(),
+        leader_task: None,
     })
 }
 
@@ -452,23 +466,30 @@ pub fn drain_worker_metrics(
     let mut rx = mesh.take_task_metrics_receiver()?;
     let mut got = crate::api::HashSet::default();
     for _ in 0..100 {
-        let _ = mesh.try_drain_pass();
-        while let Ok((stage_id, task_number, metrics)) = rx.try_recv() {
-            // The frames carry proto metrics; the store holds the decoded in-memory form the rewrite
-            // reads. A frame that fails to decode is still counted so the wait doesn't spin.
-            if let Ok(metrics) = datafusion_distributed::decode_task_metrics(metrics) {
-                store.insert(
-                    TaskKey {
-                        query_id,
-                        stage_id: stage_id as usize,
-                        task_number: task_number as usize,
-                    },
-                    metrics,
-                );
+        loop {
+            let _ = mesh.try_drain_pass();
+            let mut made_progress = false;
+            while let Ok((stage_id, task_number, metrics)) = rx.try_recv() {
+                made_progress = true;
+                // The frames carry proto metrics; the store holds the decoded in-memory form the rewrite
+                // reads. A frame that fails to decode is still counted so the wait doesn't spin.
+                if let Ok(metrics) = datafusion_distributed::decode_task_metrics(metrics) {
+                    store.insert(
+                        TaskKey {
+                            query_id,
+                            stage_id: stage_id as usize,
+                            task_number: task_number as usize,
+                        },
+                        metrics,
+                    );
+                }
+                got.insert((stage_id, task_number));
             }
-            got.insert((stage_id, task_number));
+            if !made_progress || got.len() >= expected {
+                break;
+            }
         }
-        if got.len() >= expected {
+        if got.len() >= expected || mesh.all_remote_producers_detached() {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(1));
