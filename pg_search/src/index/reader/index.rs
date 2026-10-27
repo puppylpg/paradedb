@@ -1578,9 +1578,11 @@ impl SearchIndexReader {
     /// the results for MVCC visibility, and re-query if necessary.
     ///
     /// `parallel_state_holding_shared_threshold` should only be passed if we intend to query with a shared_threshold
+    /// `parallel` keeps segment claims lazy; vector collection searches one claimed segment at a time.
     ///
     /// Fruit-side metrics (e.g. vector probe stats) are returned as opaque
     /// per-segment JSON in [`TopKSearch::segment_info`].
+    #[allow(clippy::too_many_arguments)]
     pub fn search_top_k_in_segments(
         &self,
         segment_ids: impl Iterator<Item = SegmentId>,
@@ -1589,6 +1591,7 @@ impl SearchIndexReader {
         offset: usize,
         aux_collector: Option<TopKAuxiliaryCollector>,
         parallel_state_holding_shared_threshold: Option<*mut crate::postgres::ParallelScanState>,
+        parallel: bool,
     ) -> TopKSearch {
         let (first_orderby_info, erased_features) = self.prepare_features(orderby_info);
         match first_orderby_info {
@@ -1790,26 +1793,35 @@ impl SearchIndexReader {
                 let mut tie_breaks = tie_breaks.into_iter();
                 let mut next = || tie_breaks.next().expect("tie-break feature should exist");
                 let (fruit, aggregation_results) = match tie_break_count {
-                    0 => self.collect_maybe_auxiliary(readers, collector, aux_collector),
-                    1 => self.collect_maybe_auxiliary(
+                    0 => self.collect_vector_maybe_auxiliary(
+                        readers,
+                        collector,
+                        aux_collector,
+                        parallel,
+                    ),
+                    1 => self.collect_vector_maybe_auxiliary(
                         readers,
                         collector.with_tie_break(next()),
                         aux_collector,
+                        parallel,
                     ),
-                    2 => self.collect_maybe_auxiliary(
+                    2 => self.collect_vector_maybe_auxiliary(
                         readers,
                         collector.with_tie_break((next(), next())),
                         aux_collector,
+                        parallel,
                     ),
-                    3 => self.collect_maybe_auxiliary(
+                    3 => self.collect_vector_maybe_auxiliary(
                         readers,
                         collector.with_tie_break((next(), next(), next())),
                         aux_collector,
+                        parallel,
                     ),
-                    4 => self.collect_maybe_auxiliary(
+                    4 => self.collect_vector_maybe_auxiliary(
                         readers,
                         collector.with_tie_break((next(), next(), next(), next())),
                         aux_collector,
+                        parallel,
                     ),
                     x => panic!(
                         "Unsupported sort-field count: {}. At most {MAX_TOPK_FEATURES} are supported.",
@@ -2015,6 +2027,7 @@ impl SearchIndexReader {
     /// NOTE: Scores cannot be NULL, so we do not need to differentiate the nulls-first/last cases.
     ///
     /// `parallel_state_holding_shared_threshold` should only be passed if we intend to query with a shared_threshold
+    /// `parallel` keeps segment claims lazy; vector collection searches one claimed segment at a time.
     fn top_by_score_in_segments(
         &self,
         segment_ids: impl Iterator<Item = SegmentId>,
@@ -2397,6 +2410,69 @@ impl SearchIndexReader {
         collector
             .merge_fruits(fruits)
             .expect("search should not fail")
+    }
+
+    fn collect_vector_maybe_auxiliary<'a, S>(
+        &self,
+        mut readers: impl Iterator<Item = (SegmentOrdinal, &'a SegmentReader)>,
+        collector: tantivy::vector::TopDocsByVectorSimilarity<f32, S>,
+        aux_collector: Option<TopKAuxiliaryCollector>,
+        parallel: bool,
+    ) -> (
+        tantivy::vector::VectorSimilarityFruit,
+        Option<IntermediateAggregationResults>,
+    )
+    where
+        S: SortKeyComputer + Send + Sync + 'static,
+    {
+        if aux_collector.is_some() {
+            return self.collect_maybe_auxiliary(readers, collector, aux_collector);
+        }
+        collector
+            .check_schema(self.searcher.schema())
+            .expect("vector schema should be valid");
+        let weight = self
+            .query
+            .weight(enable_scoring(false, &self.searcher))
+            .expect("creating vector filter weight should not fail");
+        if let Some(stats) = &self.directory.io_stats {
+            stats.reset();
+        }
+        let trace = self.directory.io_stats.as_ref();
+        let segment_ids: Vec<_> = self
+            .searcher
+            .segment_readers()
+            .iter()
+            .map(SegmentReader::segment_id)
+            .collect();
+        let on_segment = |ord: SegmentOrdinal| {
+            if let Some(stats) = trace {
+                stats.end_segment(segment_ids[ord as usize]);
+            }
+        };
+        let collect = |readers: &[(SegmentOrdinal, &SegmentReader)]| {
+            collector
+                .collect_segments(
+                    weight.as_ref(),
+                    readers,
+                    &tantivy::Executor::single_thread(),
+                    &on_segment,
+                )
+                .expect("vector collection should not fail")
+        };
+        let fruits = if parallel {
+            readers
+                .flat_map(|reader| collect(std::slice::from_ref(&reader)))
+                .collect()
+        } else {
+            collect(&readers.by_ref().collect::<Vec<_>>())
+        };
+        (
+            collector
+                .merge_fruits(fruits)
+                .expect("vector results should merge"),
+            None,
+        )
     }
 
     /// Collect for the given Collector, optionally paired with / wrapped with the given auxiliary
@@ -3671,13 +3747,25 @@ mod tests {
             (1, 20, 20, 2),
             (99, 100, 0, 0),
         ] {
-            let reader = open_snapshot_reader(&index_rel, range_query("id", lo, hi), false);
+            let reader = SearchIndexReader::open_with_context(
+                &index_rel,
+                range_query("id", lo, hi),
+                false,
+                MvccSatisfies::Snapshot,
+                None,
+                None,
+                false,
+                Some(io_stats::Trace::default()),
+            )
+            .unwrap();
             for reverse in [false, true] {
                 let mut ids = reader.segment_ids();
                 if reverse {
                     ids.reverse();
                 }
-                for tie_break in [false, true] {
+                for (tie_break, parallel) in
+                    [(false, false), (true, false), (false, true), (true, true)]
+                {
                     let mut order = vec![OrderByInfo {
                         feature: OrderByFeature::VectorDistance {
                             name: FieldName::from("embedding"),
@@ -3696,13 +3784,22 @@ mod tests {
                             direction: SortDirection::AscNullsLast,
                         });
                     }
+                    let checked_out = std::cell::Cell::new(0);
+                    let initial_reads = io_stats::vector_buffer_reads();
                     let top = reader.search_top_k_in_segments(
-                        ids.iter().copied(),
+                        ids.iter().copied().inspect(|_| {
+                            if parallel && expected_segments == 2 && checked_out.get() == 1 {
+                                assert!(io_stats::vector_buffer_reads() > initial_reads,
+                                    "parallel collection must search before claiming another segment");
+                            }
+                            checked_out.set(checked_out.get() + 1);
+                        }),
                         &order,
                         50,
                         0,
                         None,
                         None,
+                        parallel,
                     );
                     let docs = top
                         .results
