@@ -1578,7 +1578,6 @@ impl SearchIndexReader {
     /// the results for MVCC visibility, and re-query if necessary.
     ///
     /// `parallel_state_holding_shared_threshold` should only be passed if we intend to query with a shared_threshold
-    /// `parallel` keeps segment claims lazy; vector collection searches one claimed segment at a time.
     ///
     /// Fruit-side metrics (e.g. vector probe stats) are returned as opaque
     /// per-segment JSON in [`TopKSearch::segment_info`].
@@ -1591,7 +1590,7 @@ impl SearchIndexReader {
         offset: usize,
         aux_collector: Option<TopKAuxiliaryCollector>,
         parallel_state_holding_shared_threshold: Option<*mut crate::postgres::ParallelScanState>,
-        parallel: bool,
+        global_schedule: bool,
     ) -> TopKSearch {
         let (first_orderby_info, erased_features) = self.prepare_features(orderby_info);
         match first_orderby_info {
@@ -1797,31 +1796,31 @@ impl SearchIndexReader {
                         readers,
                         collector,
                         aux_collector,
-                        parallel,
+                        global_schedule,
                     ),
                     1 => self.collect_vector_maybe_auxiliary(
                         readers,
                         collector.with_tie_break(next()),
                         aux_collector,
-                        parallel,
+                        global_schedule,
                     ),
                     2 => self.collect_vector_maybe_auxiliary(
                         readers,
                         collector.with_tie_break((next(), next())),
                         aux_collector,
-                        parallel,
+                        global_schedule,
                     ),
                     3 => self.collect_vector_maybe_auxiliary(
                         readers,
                         collector.with_tie_break((next(), next(), next())),
                         aux_collector,
-                        parallel,
+                        global_schedule,
                     ),
                     4 => self.collect_vector_maybe_auxiliary(
                         readers,
                         collector.with_tie_break((next(), next(), next(), next())),
                         aux_collector,
-                        parallel,
+                        global_schedule,
                     ),
                     x => panic!(
                         "Unsupported sort-field count: {}. At most {MAX_TOPK_FEATURES} are supported.",
@@ -2027,7 +2026,6 @@ impl SearchIndexReader {
     /// NOTE: Scores cannot be NULL, so we do not need to differentiate the nulls-first/last cases.
     ///
     /// `parallel_state_holding_shared_threshold` should only be passed if we intend to query with a shared_threshold
-    /// `parallel` keeps segment claims lazy; vector collection searches one claimed segment at a time.
     fn top_by_score_in_segments(
         &self,
         segment_ids: impl Iterator<Item = SegmentId>,
@@ -2414,10 +2412,10 @@ impl SearchIndexReader {
 
     fn collect_vector_maybe_auxiliary<'a, S>(
         &self,
-        mut readers: impl Iterator<Item = (SegmentOrdinal, &'a SegmentReader)>,
+        readers: impl Iterator<Item = (SegmentOrdinal, &'a SegmentReader)>,
         collector: tantivy::vector::TopDocsByVectorSimilarity<f32, S>,
         aux_collector: Option<TopKAuxiliaryCollector>,
-        parallel: bool,
+        global_schedule: bool,
     ) -> (
         tantivy::vector::VectorSimilarityFruit,
         Option<IntermediateAggregationResults>,
@@ -2425,7 +2423,7 @@ impl SearchIndexReader {
     where
         S: SortKeyComputer + Send + Sync + 'static,
     {
-        if aux_collector.is_some() {
+        if !global_schedule || aux_collector.is_some() {
             return self.collect_maybe_auxiliary(readers, collector, aux_collector);
         }
         collector
@@ -2460,13 +2458,7 @@ impl SearchIndexReader {
                 )
                 .expect("vector collection should not fail")
         };
-        let fruits = if parallel {
-            readers
-                .flat_map(|reader| collect(std::slice::from_ref(&reader)))
-                .collect()
-        } else {
-            collect(&readers.by_ref().collect::<Vec<_>>())
-        };
+        let fruits = collect(&readers.collect::<Vec<_>>());
         (
             collector
                 .merge_fruits(fruits)
@@ -3740,11 +3732,14 @@ mod tests {
              INSERT INTO vector_parallelism SELECT g, CASE WHEN g % 2 = 0 THEN 'keep' ELSE 'other' END, ARRAY[g::real,1,0]::vector FROM generate_series(101,200) g;
              RESET paradedb.global_mutable_segment_rows;"
         ).unwrap();
-        for (predicate, parallel) in [
-            ("", false),
-            ("AND category = 'keep'", true),
-            ("AND id > 1", true),
+        for (predicate, workers, parallel, global_schedule) in [
+            ("", 2, false, true),
+            ("AND category = 'keep'", 2, true, false),
+            ("AND id > 1", 2, true, false),
+            ("AND category = 'keep'", 0, false, false),
+            ("AND id > 1", 0, false, false),
         ] {
+            Spi::run(&format!("SET max_parallel_workers_per_gather = {workers}")).unwrap();
             let plan = Spi::get_one::<pgrx::Json>(&format!(
                 "EXPLAIN (VERBOSE, COSTS OFF, FORMAT JSON) SELECT id FROM vector_parallelism WHERE id @@@ pdb.all() {predicate} ORDER BY embedding <-> '[1,1,0]'::vector LIMIT 5"
             )).unwrap().unwrap().0;
@@ -3758,7 +3753,7 @@ mod tests {
                     assert_eq!(node["Parallel Aware"], parallel, "{plan}");
                     assert_eq!(
                         node["Worker Selection"] == "Global vector schedule",
-                        !parallel,
+                        global_schedule,
                         "{plan}"
                     );
                     if predicate.contains("category") {
@@ -3802,7 +3797,7 @@ mod tests {
             (99, 100, 0, 0),
         ] {
             for reverse in [false, true] {
-                for (tie_break, parallel) in
+                for (tie_break, global_schedule) in
                     [(false, false), (true, false), (false, true), (true, true)]
                 {
                     let reader = SearchIndexReader::open_with_context(
@@ -3842,9 +3837,12 @@ mod tests {
                     let initial_reads = io_stats::vector_buffer_reads();
                     let top = reader.search_top_k_in_segments(
                         ids.iter().copied().inspect(|_| {
-                            if parallel && expected_segments == 2 && checked_out.get() == 1 {
-                                assert!(io_stats::vector_buffer_reads() > initial_reads,
-                                    "parallel collection must search before claiming another segment");
+                            if !global_schedule && expected_segments == 2 && checked_out.get() == 1
+                            {
+                                assert!(
+                                    io_stats::vector_buffer_reads() > initial_reads,
+                                    "legacy collection must search before claiming another segment"
+                                );
                             }
                             checked_out.set(checked_out.get() + 1);
                         }),
@@ -3853,7 +3851,7 @@ mod tests {
                         0,
                         None,
                         None,
-                        parallel,
+                        global_schedule,
                     );
                     let docs = top
                         .results
