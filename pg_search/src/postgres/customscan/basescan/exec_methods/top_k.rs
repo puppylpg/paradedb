@@ -33,7 +33,7 @@ use crate::postgres::customscan::basescan::projections::window_agg::WindowAggreg
 use crate::postgres::customscan::basescan::scan_state::BaseScanState;
 use crate::postgres::customscan::builders::custom_path::ExecMethodType;
 use crate::postgres::customscan::limit_offset::LimitOffset;
-use crate::postgres::customscan::parallel::{WorkerDecisionReason, checkout_segment_for_source};
+use crate::postgres::customscan::parallel::checkout_segment_for_source;
 use crate::query::SearchQueryInput;
 
 use pgrx::{IntoDatum, check_for_interrupts, direct_function_call, pg_sys};
@@ -421,25 +421,27 @@ impl ExecMethod for TopKScanExecState {
             } else {
                 None
             };
+            let segments = self.segments_to_query(
+                state.search_reader.as_ref().unwrap(),
+                state.parallel_state(),
+            );
+            let segment_batches: Box<dyn Iterator<Item = Vec<SegmentId>>> =
+                if state.parallel_state().is_some() {
+                    Box::new(segments.map(|id| vec![id]))
+                } else {
+                    Box::new(std::iter::once(segments.collect()))
+                };
             let mut top_k_search = self
                 .search_reader
                 .as_ref()
                 .unwrap()
                 .search_top_k_in_segments(
-                    self.segments_to_query(
-                        state.search_reader.as_ref().unwrap(),
-                        state.parallel_state(),
-                    ),
+                    segment_batches,
                     orderby_info,
                     local_limit,
                     self.offset,
                     maybe_aux_collector,
                     maybe_parallel_state,
-                    state.parallel_state().is_none()
-                        && matches!(
-                            state.worker_selection_reason,
-                            Some(WorkerDecisionReason::GlobalVectorSchedule)
-                        ),
                 );
             // Per-segment Fruit JSON → local ScanTelemetry. Workers publish into
             // DSM once at ShutdownCustomScan; the leader merges at its own Shutdown.
